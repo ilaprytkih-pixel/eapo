@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pixel Map - Combat Prototype</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="container">
+    <h1>Pixel Map</h1>
+    <div class="game-layout">
+        <div class="map-area">
+            <canvas id="map"></canvas>
+            <div class="controls">
+                <div class="info"><span id="coord">&#9647;</span> &middot; <span id="elev">&#9647;</span></div>
+                <div class="seed-display">seed: <input type="number" id="seedInput" class="seed-input" value="0" min="1"></div>
+                <span id="mapStatus" class="map-status"></span>
+                <span id="gameLog" class="game-message"></span>
+                <button class="btn" id="regenerateBtn">&#x21bb;&#xFE0E; regen</button>
+                <button class="btn" id="exportBtn">&#x21e1;&#xFE0E; export</button>
+                <button class="btn" id="importBtn" onclick="document.getElementById('importInput').click()">&#x21e3;&#xFE0E; import</button>
+                <input type="file" id="importInput" accept=".json" style="display:none">
+                <button class="btn" id="saveBtn" title="сохранить автосейв">&#x2B06;&#xFE0E; save</button>
+                <button class="btn" id="loadBtn" title="загрузить автосейв">&#x2B07;&#xFE0E; load</button>
+                <button class="btn" id="pauseBtn">&#x23F8;&#xFE0E;</button>
+                <button class="btn" id="llmBtn">LLM</button>
+                <button class="btn btn-lang" id="langBtn">RU</button>
+            </div>
+            <div class="settings">
+                <label>width <input type="range" id="mapWidth" min="120" max="480" step="10" value="240"><span class="val" id="mapWidthVal">240</span></label>
+                <label>height <input type="range" id="mapHeight" min="80" max="340" step="10" value="170"><span class="val" id="mapHeightVal">170</span></label>
+                <label>provinces <input type="range" id="provCount" min="8" max="60" value="50"><span class="val" id="provCountVal">50</span></label>
+                <label>countries <input type="range" id="countryCount" min="2" max="12" value="5"><span class="val" id="countryCountVal">5</span></label>
+                <label>terrain <input type="range" id="terrainFit" min="0" max="100" value="60"><span class="val" id="terrainFitVal">60</span></label>
+                <label><input type="checkbox" id="showProvinces" checked> prov</label>
+                <label><input type="checkbox" id="showCountries" checked> cntr</label>
+            </div>
+            <div class="balance-panel">
+                <label>atk <input type="range" id="attackRate" min="0.01" max="0.15" step="0.01" value="0.05"><span class="val" id="attackRateVal">0.05</span></label>
+                <label>def <input type="range" id="defenseRate" min="0.01" max="0.15" step="0.01" value="0.03"><span class="val" id="defenseRateVal">0.03</span></label>
+                <label>tick <input type="range" id="tickInterval" min="50" max="1000" step="50" value="200"><span class="val" id="tickIntervalVal">200</span></label>
+                <label>bot N <input type="range" id="botInterval" min="1" max="50" step="1" value="10"><span class="val" id="botIntervalVal">10</span></label>
+                <label>flank <input type="range" id="flankPenalty" min="0" max="0.4" step="0.01" value="0.2"><span class="val" id="flankPenaltyVal">0.2</span></label>
+                <label>growth <input type="range" id="growthRate" min="0.005" max="0.05" step="0.005" value="0.015"><span class="val" id="growthRateVal">0.015</span></label>
+                <label>tax <input type="range" id="taxRate" min="0.01" max="0.2" step="0.01" value="0.05"><span class="val" id="taxRateVal">0.05</span></label>
+                <label>army up <input type="range" id="armyUpkeepRate" min="0.001" max="0.02" step="0.001" value="0.005"><span class="val" id="armyUpkeepRateVal">0.005</span></label>
+                <label>infra up <input type="range" id="infraUpkeepRate" min="0.001" max="0.02" step="0.001" value="0.003"><span class="val" id="infraUpkeepRateVal">0.003</span></label>
+            </div>
+            <div class="llm-panel" id="llmPanel" style="display:none;">
+                <div class="llm-global">
+                    <label><input type="checkbox" id="llmEnabled"> LLM вкл</label>
+                    <label>раунд, тиков <input type="number" id="llmRoundTicks" value="30" min="10" step="10" style="width:56px;"></label>
+                    <label>deadline, мс <input type="number" id="llmDeadline" value="15000" min="1000" step="1000" style="width:64px;"></label>
+                    <label>макс. токенов <input type="number" id="llmMaxTokens" value="400" min="100" step="50" style="width:56px;"></label>
+                    <label>API key <input type="password" id="llmApiKey" style="width:90px;" title="для внешних API (Bearer), локальным серверам не нужен"></label>
+                    <button class="btn" id="llmForceAllBtn">Принудить все</button>
+                </div>
+                <div id="llmCountries"></div>
+                <div id="llmStatus" class="llm-status"></div>
+                <div id="llmActivity" class="llm-activity"></div>
+                <div id="llmTreaties" class="llm-treaties"></div>
+                <div id="llmPlayerLetters" class="llm-letters"></div>
+            </div>
+        </div>
+        <div class="country-panel" id="countryPanel">
+            <div class="country-panel-header" id="countryPanelToggle">Countries &#9662;</div>
+            <div class="country-panel-body" id="countryPanelBody"></div>
+        </div>
+    </div>
+</div>
+<script src="lang.js"></script>
+<script src="map-generator.js"></script>
+<script src="game-state.js"></script>
+<script src="economy.js"></script>
+<script src="combat.js"></script>
+<script src="diplomacy.js"></script>
+<script src="bots.js"></script>
+<script src="llm-agent.js"></script>
+<script src="renderer.js"></script>
+<script src="ui-controls.js"></script>
+<script src="main.js"></script>
+</body>
+</html>
