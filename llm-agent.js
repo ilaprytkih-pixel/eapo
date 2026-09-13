@@ -10,10 +10,16 @@ const LLM_PRESETS = {
 
 const LLM_PERSONALITIES = ['aggressive', 'defensive', 'diplomatic', 'opportunist'];
 
-const LLM_ACTION_LIMITS = { attacks: 3, reinforces: 2, diplo: 1, letters: 2, builds: 1 };
+// Лимиты за раунд. Старая схема (1 дипломатический акт на раунд) делала
+// противников тупыми: агент не мог одновременно ответить на оферту и
+// объявить войну. Ответы на входящие предложения (ACCEPT/REJECT) теперь
+// не тратят бюджет — застревать в переписке смысла нет.
+const LLM_ACTION_LIMITS = { attacks: 3, reinforces: 3, diplo: 2, wars: 1, letters: 2, builds: 2 };
 const LLM_MAX_LISTED_PROVINCES = 25;
 const LLM_BOT_FALLBACK_ROUNDS = 5;
 const LLM_INVALID_STREAK_LIMIT = 3;
+// Сколько пар «наш вопрос → ответ модели» держать в контексте.
+const LLM_HISTORY_ROUNDS = 2;
 
 const PERSONALITY_PROMPTS = {
     aggressive: 'Приоритет — территориальная экспансия. Атакуй при малейшем превосходстве, не бойся риска. Слабый сосед — законная цель.',
@@ -85,10 +91,20 @@ function llmCountryConfig(cid) {
             temperature: G.llm.temperature != null ? G.llm.temperature : 0.5,
             personality: 'opportunist',
             apiKey: llmGetStoredApiKey(),
-            status: { state: 'idle', invalidStreak: 0, botFallbackRounds: 0, totalCalls: 0, totalTimeouts: 0, totalErrors: 0, totalInvalid: 0 }
+            status: {
+                state: 'idle', invalidStreak: 0, botFallbackRounds: 0,
+                totalCalls: 0, totalTimeouts: 0, totalErrors: 0, totalInvalid: 0,
+                totalRepaired: 0, legalMoves: null, history: [], worldSig: null
+            }
         };
     }
-    return G.llm.countries[cid];
+    // Сейвы старых версий: недостающие поля статуса доводим до текущей схемы.
+    const cfg = G.llm.countries[cid];
+    if (!cfg.status) cfg.status = { state: 'idle' };
+    if (!Array.isArray(cfg.status.history)) cfg.status.history = [];
+    if (!('worldSig' in cfg.status)) cfg.status.worldSig = null;
+    if (!('legalMoves' in cfg.status)) cfg.status.legalMoves = null;
+    return cfg;
 }
 
 // Все страны в режиме LLM (включая fallback и мёртвых — для таймера fallback).
@@ -137,10 +153,12 @@ function buildSystemPrompt(personality) {
         'Ты управляешь страной через JSON-команды. Другие страны управляются такими же агентами — они могут лгать и блефовать.',
         'ФОРМАТ: отвечай ТОЛЬКО одним валидным JSON объектом без markdown и без текста вокруг:',
         '{"reasoning":"...","memory_update":{"goals_add":[],"goals_remove":[],"enemy_notes_update":{},"key_events_add":[]},"actions":[...]}',
+        'ГЛАВНОЕ ПРАВИЛО: в снапшоте есть секция CANDIDATE MOVES — это ПОЛНЫЙ список легальных ходов, уже просчитанных игрой (численность, прогноз боя, цена). Не выдумывай своих вариантов: выбирай из этого списка и передавай его id в поле "move", например {"type":"ATTACK","move":"A1"}. Если нужного хода в списке нет — значит он нелегален.',
+        'Бой в игре детерминирован: побеждает тот, у кого больше сил по формуле из прогноза. Строка "WIN, you keep ~N" означает гарантированную победу с N выживших; "LOSE" — гарантированное поражение. Никогда не выбирай ходы с LOSE.',
         'ДОСТУПНЫЕ ДЕЙСТВИЯ (поле type):',
-        'ATTACK {from,to,army_pct} — сухопутная атака из своей провинции на соседнюю вражескую (army_pct 10-100). ВАЖНО: атака возможна только если идёт война с владельцем цели (см. WARS). Если войны нет — сначала отправь DECLARE_WAR, иначе атака будет отклонена.',
-        'SEA_ATTACK {from_port_province,to,army_pct} — морской десант из своего порта на прибрежную вражескую провинцию (нужны корабли). Тоже требует войны.',
-        'REINFORCE {from,to,army_pct} — переброска войск между своими соседними провинциями',
+        'ATTACK {move} или {from,to,army_pct} — сухопутная атака из своей провинции на соседнюю вражескую (army_pct 10-100). ВАЖНО: атака возможна только если идёт война с владельцем цели (см. WARS). Если войны нет — сначала отправь DECLARE_WAR, иначе атака будет отклонена.',
+        'SEA_ATTACK {move} или {from_port_province,to,army_pct} — морской десант из своего порта на прибрежную вражескую провинцию (нужны корабли). Тоже требует войны.',
+        'REINFORCE {move} или {from,to,army_pct} — переброска войск между своими соседними провинциями',
         'DECLARE_WAR {target_country} — объявление войны',
         'PROPOSE_PEACE {target_country} — предложить мир (только если идёт война)',
         'ACCEPT_PEACE {from_country} / REJECT_PEACE {from_country} — ответ на поступившее предложение мира',
@@ -152,7 +170,7 @@ function buildSystemPrompt(personality) {
         'BUILD_SHIP {province} — построить корабль в своей провинции с портом',
         'SEND_LETTER {to_country,text} — письмо другому государству (текст до 400 символов)',
         'WAIT — ничего не делать',
-        'ОГРАНИЧЕНИЯ за раунд: максимум 3 атаки, 2 переброски, 1 дипломатический акт (война/мир/договор вместе), 2 письма, 1 строительство.',
+        'ОГРАНИЧЕНИЯ за раунд: максимум 3 атаки, 3 переброски, 2 инициативных дипломатических акта (война/мир/новое предложение; объявление войны — не более 1), 2 письма, 2 стройки. Ответы на входящие оферты и предложения мира лимитом не ограничены.',
         'ФОРМАТ ID: провинции указывай как в снапшоте — P49 (или просто 49). Страну можно указывать числом (id) или точным именем из снапшота.',
         'Используй ТОЛЬКО провинции, перечисленные в снапшоте. Не придумывай ID.',
         'ВАЖНО: слово INTERIOR в снапшоте — это СВОДКА внутренних провинций, а не провинция. Не указывай его в действиях.',
@@ -238,7 +256,8 @@ function provShortName(cid) {
 }
 
 function isAdjacentSet(a, b) {
-    if (!a || !b) return false;
+    // b — числовой id провинции. `!b` ломалось на id 0 («цель не соседняя»).
+    if (!a || b == null || b < 0 || !a.neighbors) return false;
     return a.neighbors instanceof Set ? a.neighbors.has(b) : a.neighbors.includes(b);
 }
 
@@ -257,6 +276,19 @@ function buildSnapshot(cid, tick) {
     push('YOU: ' + c.name + ' (id:' + cid + ') | PERSONALITY: ' + (cfg.personality || 'opportunist') + ' | MODE: LLM');
     push('TREASURY: ' + Math.round(c.treasury || 0) + ' | TREND: ' + treasuryTrend(c) + ' | CRISIS_TURNS: ' + (c.crisisTurns || 0));
     push('WAR_EXHAUSTION: ' + Math.round(c.warExhaustion || 0));
+
+    // Расстановка сил: агент должен понимать, кто лидирует и насколько он отстал.
+    const ranking = countryList
+        .filter(oc => oc && oc.provinces && oc.provinces.length > 0)
+        .map(oc => ({ cid: oc.id, name: oc.name, power: llmCountryPower(oc.id) }))
+        .sort((a, b) => b.power - a.power);
+    if (ranking.length) {
+        const myRank = ranking.findIndex(r => r.cid === cid) + 1;
+        const top = ranking[0];
+        push('POWER RANKING: ' + ranking.map((r, i) => (i + 1) + '.' + (r.cid === cid ? 'YOU(' + r.name + ')' : r.name) + ':' + Math.round(r.power)).join(' ') +
+            ' | вы ' + myRank + '-е из ' + ranking.length +
+            (top.cid !== cid ? ', лидер ' + top.name + ' в ' + (myRank > 1 ? (top.power / Math.max(1, ranking[myRank - 1].power)).toFixed(2) : '1.00') + ' раза сильнее вас' : ' — вы лидер'));
+    }
 
     const wars = [];
     for (const [k, w] of (G.wars || [])) {
@@ -507,6 +539,12 @@ function buildSnapshot(cid, tick) {
     push('=== MEMORY ===');
     const mem = getLlmMemory(c);
     let memCount = 0;
+    // Факты, записанные самой игрой (llmObserveWorld) — им можно верить,
+    // в отличие от того, что модель «запомнила» сама.
+    if (mem.sys_events && mem.sys_events.length) {
+        push('--- FACTS (записано игрой, доверяй без проверки) ---');
+        for (const ev of mem.sys_events.slice(-12)) { push('- R' + ev.turn + ': ' + ev.event); memCount++; }
+    }
     for (const g of mem.goals) { push('- Goal: ' + g); memCount++; }
     for (const key in mem.enemy_models) {
         const oc = countryList[parseInt(key)];
@@ -519,8 +557,26 @@ function buildSnapshot(cid, tick) {
     for (const sn of mem.strategic_notes) { push('- Note: ' + sn); memCount++; }
     if (!memCount) push('(empty — формируй память через memory_update)');
 
+    // Угрозы и готовые ходы — главное, ради чего строится снапшот v2.
+    let moves = null;
+    try { moves = buildLegalMoves(cid); } catch (e) { moves = null; }
+    if (moves) {
+        cfg.status.legalMoves = moves;
+        const threats = assessThreats(cid, moves);
+        push('');
+        push('=== THREATS ===');
+        if (threats.length === 0) push('(прямых угроз нет)');
+        for (const th of threats) push('! ' + th);
+
+        push('');
+        push('=== CANDIDATE MOVES (выбирай отсюда, передавай id в поле "move") ===');
+        for (const line of renderLegalMoves(moves)) push(line);
+    } else {
+        cfg.status.legalMoves = null;
+    }
+
     push('');
-    push('REMINDER: reply ONLY with valid JSON. Max 3 attacks, 2 reinforces, 1 diplomacy (war/peace/treaty all count together), 2 letters, 1 build per round.');
+    push('REMINDER: reply ONLY with valid JSON. Max 3 attacks, 3 reinforces, 2 proactive diplomacy (declare_war/peace/new offer, at most 1 declare_war), 2 letters, 2 builds per round. Never pick a move marked LOSE.');
 
     return L.join('\n');
 }
@@ -533,26 +589,52 @@ function makeTracked(promise) {
     return t;
 }
 
+// История диалога: короткие пары «снапшот-выжимка → канонический JSON».
+// Модели отдаём НЕ её сырой ответ, а нормализованную пересборку — так
+// контекст заодно учит формату и не тянет мусор.
+function buildLlmMessages(cid, snapshot) {
+    const cfg = llmCountryConfig(cid);
+    const msgs = [{ role: 'system', content: buildSystemPrompt(cfg.personality) }];
+    const hist = (cfg.status && Array.isArray(cfg.status.history)) ? cfg.status.history : [];
+    for (const h of hist.slice(-LLM_HISTORY_ROUNDS)) {
+        msgs.push({ role: 'user', content: h.digest });
+        msgs.push({ role: 'assistant', content: h.answer });
+    }
+    msgs.push({ role: 'user', content: snapshot });
+    return msgs;
+}
+
+function llmHistoryDigest(snapshot) {
+    // Выжимка прошлого снапшота: только «шапка» (ход, казна, войны, сила) —
+    // полный снапшот в истории раздувал бы контекст в разы.
+    const keep = [];
+    for (const line of String(snapshot || '').split('\n')) {
+        if (/^(WORLD TURN|YOU|TREASURY|WARS|POWER RANKING|WAR_EXHAUSTION|REPUTATION):/.test(line)) keep.push(line);
+        if (keep.length >= 6) break;
+    }
+    return '(ПРЕДЫДУЩИЙ РАУД)\n' + keep.join('\n');
+}
+
 async function callLLMWithTimeout(cid, snapshot, deadlineMs, url, cfg) {
     const AbortCtrl = typeof AbortController !== 'undefined' ? AbortController : null;
     const ctrl = AbortCtrl ? new AbortCtrl() : null;
     const timer = ctrl ? setTimeout(() => ctrl.abort(), deadlineMs || 6000) : null;
-    try {
+    const headers = {
+        'Content-Type': 'application/json',
+        ...((cfg.apiKey || llmGetStoredApiKey()) ? { Authorization: 'Bearer ' + (cfg.apiKey || llmGetStoredApiKey()) } : {})
+    };
+    const maxTokens = (G.llm && G.llm.maxTokens) || 400;
+
+    const post = async (messages, temperature) => {
         const res = await fetch(url, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                ...(cfg.apiKey || llmGetStoredApiKey() ? { Authorization: 'Bearer ' + (cfg.apiKey || llmGetStoredApiKey()) } : {})
-            },
+            headers,
             body: JSON.stringify({
                 model: cfg.model || 'deepseek-chat',
                 user: 'game-country-' + cid,
-                temperature: cfg.temperature != null ? cfg.temperature : 0.5,
-                max_tokens: (G.llm && G.llm.maxTokens) || 400,
-                messages: [
-                    { role: 'system', content: buildSystemPrompt(cfg.personality) },
-                    { role: 'user', content: snapshot }
-                ]
+                temperature: temperature,
+                max_tokens: maxTokens,
+                messages
             }),
             signal: ctrl ? ctrl.signal : undefined
         });
@@ -561,9 +643,32 @@ async function callLLMWithTimeout(cid, snapshot, deadlineMs, url, cfg) {
         if (data && data.choices && data.choices[0] && data.choices[0].message) {
             const content = data.choices[0].message.content;
             if (typeof content === 'string' && content.trim()) return content;
-            return null; // пустой ответ — мягкий сбой, не невалидный JSON
         }
-        return null;
+        return null; // пустой ответ — мягкий сбой, не невалидный JSON
+    };
+
+    try {
+        const content = await post(buildLlmMessages(cid, snapshot), cfg.temperature != null ? cfg.temperature : 0.5);
+        if (content == null) return null;
+
+        // Один дешёвый «ремонт»: вместо падения в fallback просим модель
+        // отдать тот же ответ валидным JSON. Всё в пределах общего дедлайна.
+        const canRepair = !G.llm || G.llm.repairRetry !== false;
+        if (canRepair && typeof parseLlmJson === 'function' && !parseLlmJson(content)) {
+            try {
+                const fixed = await post(buildLlmMessages(cid, snapshot).concat([
+                    { role: 'assistant', content: content.slice(0, 1200) },
+                    { role: 'user', content: 'Твой ответ не является валидным JSON. Ответь ТОЛЬКО валидным JSON объектом {"reasoning":...,"actions":[...]} с теми же решениями. Никакого текста и markdown.' }
+                ]), 0);
+                if (fixed && parseLlmJson(fixed)) {
+                    const st = llmCountryConfig(cid).status;
+                    st.totalRepaired = (st.totalRepaired || 0) + 1;
+                    if (typeof pushLlmActivity === 'function') pushLlmActivity(cid, 'JSON восстановлен повторным запросом');
+                    return fixed;
+                }
+            } catch (e) { /* ремонт не удался — отдаём исходный ответ */ }
+        }
+        return content;
     } finally {
         if (timer) clearTimeout(timer);
     }
@@ -601,6 +706,7 @@ function llmStartRound() {
         st.state = 'collecting';
         st.lastError = null;
         try {
+            if (typeof llmObserveWorld === 'function') llmObserveWorld(cid);
             const snapshot = buildSnapshot(cid, G.tickCount);
             st.lastSnapshot = snapshot;
             st.snapshotLen = snapshot.length;
@@ -713,6 +819,9 @@ function processLlmTurn() {
 // ---------- Разбор ответа ----------
 
 function parseLLMResponse(raw) {
+    // Терпеливый разбор живёт в llm-brain.js (repairJsonText): чинит markdown,
+    // хвостовые запятые, одинарные кавычки, Python-литералы и оборванный вывод.
+    if (typeof parseLlmJson === 'function') return parseLlmJson(raw);
     if (!raw || typeof raw !== 'string') return null;
     let txt = raw.trim();
     const fence = txt.match(/```(?:json)?\s*([\s\S]+?)\s*```/i);
@@ -760,9 +869,21 @@ function executeDecisions(cid, response) {
     st.lastReasoning = typeof parsed.reasoning === 'string' ? parsed.reasoning.slice(0, 600) : '';
     applyMemoryUpdate(cid, parsed.memory_update);
 
-    const used = { attacks: 0, reinforces: 0, diplo: 0, letters: 0, builds: 0 };
+    const used = { attacks: 0, reinforces: 0, diplo: 0, wars: 0, letters: 0, builds: 0 };
     const results = [];
     const actions = Array.isArray(parsed.actions) ? parsed.actions : [];
+    // История раундов: модели на следующем ходу видно, что она решила и что
+    // из этого вышло. Ответ кладём нормализованным (пересборка JSON) — так
+    // контекст заодно учит формату, а не закрепляет ошибки.
+    try {
+        if (!st.history) st.history = [];
+        st.history.push({
+            turn: G.turnNumber,
+            digest: llmHistoryDigest(st.lastSnapshot),
+            answer: JSON.stringify({ reasoning: (st.lastReasoning || '').slice(0, 300), actions: actions.slice(0, 6) })
+        });
+        if (st.history.length > LLM_HISTORY_ROUNDS) st.history.splice(0, st.history.length - LLM_HISTORY_ROUNDS);
+    } catch (e) { /* история не критична */ }
     let okCount = 0;
     for (const a of actions) {
         const reason = validateAndExecuteAction(cid, a, used);
@@ -834,6 +955,19 @@ function validateAndExecuteAction(cid, a, used) {
     if (!a || typeof a !== 'object') return 'действие не объект';
     const c = countryList[cid];
     if (!c) return 'страна не существует';
+
+    // Ссылка на готовый ход из CANDIDATE MOVES: {"type":"ATTACK","move":"A1"}
+    // или просто {"move":"A1"}. Так модель выбирает из просчитанного списка,
+    // а не выдумывает id провинций. army_pct разрешено подкрутить вручную.
+    const moveRef = (a.move != null) ? a.move : (a.move_id != null ? a.move_id : null);
+    if (moveRef != null) {
+        const resolved = (typeof resolveMoveRef === 'function') ? resolveMoveRef(cid, moveRef) : null;
+        if (!resolved) return 'неизвестный id хода «' + moveRef + '» (см. CANDIDATE MOVES)';
+        const pctOverride = parseFloat(a.army_pct);
+        a = Object.assign({}, resolved);
+        // Готовый ход уже просчитан, но долю войск разрешаем подкрутить.
+        if (isFinite(pctOverride)) a.army_pct = pctOverride;
+    }
     const type = a.type;
 
     switch (type) {
@@ -904,6 +1038,7 @@ function validateAndExecuteAction(cid, a, used) {
             return null;
         }
         case 'DECLARE_WAR': {
+            if (used.wars >= LLM_ACTION_LIMITS.wars) return 'лимит объявлений войны за раунд';
             if (used.diplo >= LLM_ACTION_LIMITS.diplo) return 'лимит дипломатических действий';
             const t = parseCountryRef(a.target_country);
             if (t < 0 || t === cid) return 'неверная цель';
@@ -911,6 +1046,7 @@ function validateAndExecuteAction(cid, a, used) {
             startWar(cid, t);
             recordCombat(cid, t);
             used.diplo++;
+            used.wars++;
             return null;
         }
         case 'PROPOSE_PEACE': {
@@ -923,7 +1059,7 @@ function validateAndExecuteAction(cid, a, used) {
             return null;
         }
         case 'ACCEPT_PEACE': {
-            if (used.diplo >= LLM_ACTION_LIMITS.diplo) return 'лимит дипломатических действий';
+            // Ответ на входящее предложение лимитом не ограничен.
             const t = parseCountryRef(a.from_country);
             if (t < 0) return 'неверная цель';
             if (!getPeaceProposals(cid).includes(t)) return 'нет предложения мира от этой страны';
@@ -935,12 +1071,10 @@ function validateAndExecuteAction(cid, a, used) {
             return ok ? null : 'не удалось заключить мир';
         }
         case 'REJECT_PEACE': {
-            if (used.diplo >= LLM_ACTION_LIMITS.diplo) return 'лимит дипломатических действий';
             const t = parseCountryRef(a.from_country);
             if (t < 0) return 'неверная цель';
             if (!getPeaceProposals(cid).includes(t)) return 'нет предложения мира от этой страны';
             removePeaceProposal(cid, t);
-            used.diplo++;
             return null;
         }
         case 'PROPOSE_TREATY': {
@@ -972,23 +1106,20 @@ function validateAndExecuteAction(cid, a, used) {
             return null;
         }
         case 'ACCEPT_TREATY': {
-            if (used.diplo >= LLM_ACTION_LIMITS.diplo) return 'лимит дипломатических действий';
+            // Ответ на входящую оферту лимитом не ограничен.
             const pid = parseInt(a.proposal_id);
             const prop = getProposalById(pid);
             if (!prop || prop.status !== 'pending') return 'оферта не найдена';
             if (cid === prop.lastOfferBy) return 'нельзя принять собственную оферту';
             if (!acceptTreatyProposal(pid, cid)) return 'не удалось принять договор';
-            used.diplo++;
             return null;
         }
         case 'REJECT_TREATY': {
-            if (used.diplo >= LLM_ACTION_LIMITS.diplo) return 'лимит дипломатических действий';
             const pid = parseInt(a.proposal_id);
             const prop = getProposalById(pid);
             if (!prop || prop.status !== 'pending') return 'оферта не найдена';
             if (cid === prop.lastOfferBy) return 'нельзя отклонить собственную оферту';
             rejectTreatyProposal(pid, cid);
-            used.diplo++;
             return null;
         }
         case 'TERMINATE_TREATY': {
@@ -1109,6 +1240,7 @@ async function forceLlmCall(cid) {
     }
     const cfg = llmCountryConfig(cid);
     const st = cfg.status;
+    if (typeof llmObserveWorld === 'function') llmObserveWorld(cid);
     const snapshot = buildSnapshot(cid, G.tickCount);
     st.lastSnapshot = snapshot;
     st.snapshotLen = snapshot.length;

@@ -10,7 +10,10 @@ function findCountryOfProvince(pid) {
 }
 
 function provincesAdjacent(a, b) {
-    if (!a || !b || !b.id) return false;
+    // ВАЖНО: проверяем именно наличие объектов, а не их «истинность» —
+    // id провинции может быть 0, и `!b.id` молча запрещал атаковать
+    // нулевую провинцию (startCapture возвращал null).
+    if (!a || !b || b.id == null || !a.neighbors) return false;
     return a.neighbors instanceof Set ? a.neighbors.has(b.id) : a.neighbors.includes(b.id);
 }
 

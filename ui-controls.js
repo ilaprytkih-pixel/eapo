@@ -142,6 +142,9 @@ function setupBalanceSliders() {
         if (!el || !label) return;
         const update = () => {
             const v = parseFloat(el.value);
+            // Пустое/битое значение поля не должно превращать баланс в NaN:
+            // с NaN в attackRate/defenseRate бой молча останавливается.
+            if (!isFinite(v)) return;
             label.textContent = v;
             if (id === 'attackRate') G.params.attackRate = v;
             else if (id === 'defenseRate') G.params.defenseRate = v;
@@ -158,6 +161,7 @@ function setupBalanceSliders() {
         if (!el || !label) return;
         const update = () => {
             const v = parseFloat(el.value);
+            if (!isFinite(v)) return;
             label.textContent = v;
             if (id === 'growthRate') G.params.growthRate = v;
             else if (id === 'taxRate') G.params.taxRate = v;
@@ -1013,13 +1017,17 @@ function doRefreshLlmPanelStatus() {
         if (!cfg) continue;
         const st = cfg.status || {};
         const stateLabel = st.state || 'idle';
+        const topMoves = (st.legalMoves && st.legalMoves.attacks && st.legalMoves.attacks.length)
+            ? st.legalMoves.attacks.slice(0, 3).map(m => m.id + ' ' + m.line).join('\n')
+            : '';
         html += `<div class="llm-status-line">
             <span class="llm-cname">${escHtml(c.name)}</span>
             <span class="llm-state-${stateLabel}">${stateLabel}</span>
             ${st.snapshotLen ? `<span>snap:${st.snapshotLen}b</span>` : ''}
-            <span>calls:${st.totalCalls || 0} to:${st.totalTimeouts || 0} err:${st.totalErrors || 0} inv:${st.totalInvalid || 0}</span>
+            <span>calls:${st.totalCalls || 0} to:${st.totalTimeouts || 0} err:${st.totalErrors || 0} inv:${st.totalInvalid || 0}${st.totalRepaired ? ' fix:' + st.totalRepaired : ''}</span>
             ${(st.botFallbackRounds || 0) > 0 ? `<span style="color:#dd9944">bot-fallback:${st.botFallbackRounds}</span>` : ''}
             ${st.lastError ? `<span style="color:#dd8888">${escHtml(st.lastError)}</span>` : ''}
+            ${topMoves ? `<details><summary>top moves</summary><pre>${escHtml(topMoves)}</pre></details>` : ''}
             ${st.lastReasoning ? `<details><summary>reasoning</summary><pre>${escHtml(st.lastReasoning)}</pre></details>` : ''}
             ${st.lastActions && st.lastActions.length ? `<details><summary>actions (${st.lastActions.length})</summary><pre>${escHtml(JSON.stringify(st.lastActions))}</pre></details>` : ''}
             ${st.lastSnapshot ? `<details><summary>snapshot</summary><pre>${escHtml(st.lastSnapshot)}</pre></details>` : ''}
